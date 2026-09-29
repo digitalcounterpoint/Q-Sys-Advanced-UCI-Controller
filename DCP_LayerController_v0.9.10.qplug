@@ -1,0 +1,1789 @@
+--#############################################################################
+--  DIGITAL COUNTERPOINT ~ LAYER CONTROLLER  (PLUGIN)
+--#############################################################################
+--  Drives UCI layer visibility from a configuration grid.  Each row binds one
+--  named UCI layer to an "enable" toggle (exposed as a user pin) and adds the
+--  behaviours a real panel needs: radio groups, parent/child nesting, per-layer
+--  in/out transitions, and STICKY radio groups.
+--
+--  Sticky radio groups are the reason this plugin exists.  An ordinary radio
+--  group is a plain set of mutually exclusive toggles, so pressing the member
+--  that is already lit turns it off and the group ends up showing NOTHING.  For
+--  a navigation bar that is always wrong - one view must always be on screen.
+--  Ticking Sticky makes a group refuse to empty:
+--
+--    * pressing the live member re-asserts it instead of clearing it;
+--    * if the group is ever found empty (startup, Reset, a config edit) its
+--      first row is selected automatically;
+--    * hiding the group's parent does NOT clear the selection, so when the
+--      parent comes back the same member is restored.
+--
+--  Sticky is a per-GROUP setting: the first row of a group owns the tick and
+--  the remaining members mirror it (their tick greys out).  Same rule as the
+--  existing Reset Group column.
+--
+--  ---------------------------------------------------------------------------
+--  WORKED EXAMPLE - the nav + automix case
+--  ---------------------------------------------------------------------------
+--  The scenario this was built for (see the venue's UCI script): a
+--  Zones/Mics nav pair where one view is always up, a Mic Buttons bar that must
+--  stay on screen whenever Mics is selected, and a Mic Faders panel that has to
+--  give way to Automix without taking the Mic Buttons bar with it.
+--
+--    Row  Layer Name    Logical  Radio Group  Sticky  Parent Layer
+--    ---  ------------  -------  -----------  ------  ------------
+--     1   Zones                  nav            X
+--     2   MicsNav          X     nav            X
+--     3   MicButtons                                  MicsNav
+--     4   MicsFaders             micmode        X     MicsNav
+--     5   Automix                micmode        X     MicsNav
+--
+--  MicsNav is a Logical Parent - it has no layer of its own, it just represents
+--  "the Mics view is selected", so it can gate MicButtons without being subject
+--  to the Automix swap.  The inner micmode group is sticky too, so exactly one
+--  of MicsFaders / Automix is up whenever MicsNav is up, and neither press can
+--  leave the mic area blank.  Parent Layer alone could not express this: the
+--  nav pair could be turned off entirely, and parenting MicButtons to the
+--  MicsFaders layer meant engaging Automix hid the bar as well.
+--
+--  ---------------------------------------------------------------------------
+--  PIN ACCESS
+--  ---------------------------------------------------------------------------
+--  v0.9.1 adds the panel lock.  It used to live in the venue's Text Controller
+--  as a Lua variable and a table of PIN-to-layer rows, which meant the one
+--  thing an operator most wants to see - who is allowed what - was readable
+--  only by opening a script.  It is now three more columns in this grid and a
+--  handful of pins.
+--
+--  The pad is the stock Q-SYS PIN Pad.  Its pin.match.0..N-1 booleans reach
+--  this plugin's Pin Matched inputs and its logout trigger reaches Lock.  The
+--  plugin then holds which code is live (Pin Active), reports whether the panel
+--  is open (Unlocked), and gates every layer accordingly.
+--
+--  ONE ROUTE, NOT TWO.  Either wire those pins in the design OR let
+--  UCITextController_V1.6.lua mirror them - it already holds a proxy for the
+--  pad and does exactly this - but not both, or two writers share one input.
+--  The designs this was written for use the script.
+--
+--  AND LEAVE DimTSC ON THE PAD.  Everything that locks the panel funnels
+--  through the pad's own logout trigger, which is what also clears its match
+--  state.  Wiring the dim straight to this plugin's Lock pin instead would lock
+--  the layers while leaving the pad believing it was still logged in - and one
+--  Enter on an empty code would let the next person straight back in.
+--
+--  Three kinds of permission column:
+--
+--    Default  what you get when the page loads, and what is allowed while the
+--             panel is LOCKED.  THE ONLY column that is a STATE as well as a
+--             permission - entering it writes the enables to match, which is
+--             what puts the login screen back on a logout.
+--    PIN Off  what a panel with Pin Enabled switched off may reach.  A
+--             PERMISSION MASK and nothing else, as of v0.9.7.
+--    PIN n    the same, for while code n is the live one.
+--
+--  A permission mask FORCES DOWN a layer it does not tick - not by its button,
+--  not by a radio group, not by a script writing its enable pin.  A layer it
+--  DOES tick is merely allowed; something still has to raise it.
+--
+--  PIN OFF STOPPED SEEDING IN v0.9.7, and the reason is worth keeping.  A
+--  permission column is ticked with everything the role may REACH, and a state
+--  column with the much smaller set that should be ON SCREEN.  While PIN Off
+--  was both, ticking it honestly - every menu, sub-menu, source detail and mic
+--  layout a lock-free panel can get to - raised the lot at once the moment the
+--  lock was disarmed or the Core came up.  Ticking it narrowly instead made
+--  those layers unreachable for the rest of the session.  There was no third
+--  answer, so the two jobs were split: Default states, everything else
+--  permits.  With PIN Off ticked and not seeding, the login layer masks itself
+--  off for free, because PIN Off does not tick it.
+--
+--  What supplies the state instead: the enables Q-SYS persisted (adopted at
+--  startup, so a Core comes back where it was) and the Reassert pulse, which
+--  asks whatever owns the layers to say again what it wants.
+--
+--  That split is deliberate.  A PIN column that also raised its layers would
+--  be a second, invisible writer on every enable pin, racing whatever else
+--  drives them.  Permission composes instead: the venue's script goes on
+--  writing the layers its mode wants, and the plugin refuses the ones this
+--  login is not entitled to.
+--
+--  REFUSED IS NOT FORGOTTEN (v0.9.5).  A write the live column will not allow
+--  still records its request; only the enable pin is snapped back.  So the
+--  script states what the venue wants whenever it likes, and each layer comes
+--  up the moment a column that permits it goes live.  Before v0.9.5 the
+--  request was dropped, which made the Reassert pulse the ONLY way anything
+--  script-owned came back after a login - one round-trip, no memory behind it.
+--
+--  A consequence worth knowing when reading a grid: a row nothing seeds and
+--  nothing external ever writes is never requested, so ticking it in PIN 1..n
+--  alone raises it never.  That bites hardest on a LOGICAL PARENT, which draws
+--  nothing itself and so gives no clue: its children read enable true and
+--  visible false, on a panel that looks correctly configured.  Give a gate
+--  like that a Default tick - it is free, because a logical row draws nothing
+--  on the locked panel either.
+--
+--  AN EMPTY COLUMN is an unconfigured one, and the two cases want opposite
+--  answers.  PIN Off fails OPEN - Pin Enabled starts false, so a v0.9 design
+--  opens in v0.9.1 and behaves exactly as it did until the first tick goes in.
+--  Default and every PIN column fail CLOSED, because they are the locked state
+--  and the per-code grants of a security feature and a blank one that permitted
+--  everything would be a lock that had quietly stopped locking.  Status names
+--  the offending column rather than leaving a dark panel unexplained.  Either
+--  way an empty column SEEDS NOTHING, so it can never wipe a panel's state.
+--
+--  REDUCING Number of PIN Codes destroys the PIN columns above the new count
+--  and their ticks go with them, the same way reducing Number of Layers loses
+--  its rows.  Raising it again gives you blank columns, which fail closed.
+--
+--  Sticky is what turns a widened mask back into a visible layer.  A sticky
+--  group whose selection has just been forbidden is an empty group, and an
+--  empty sticky group selects its first PERMITTED member - so a Login / Lock
+--  pair with Login ticked in Default and Lock ticked in every PIN column swaps
+--  itself on login and swaps back on logout, with no per-PIN state anywhere.
+--
+--  Pin Matched is read on its RISING EDGE ONLY, never its level.  The stock
+--  pad's documentation does not say whether pin.match.N latches after a match
+--  or merely pulses, and on an edge it does not matter: the edge happens once
+--  per login either way, a level left latched across a logout raises no new
+--  edge, and a stale one therefore cannot hand its layers to the next person
+--  who logs in on an ordinary code.
+--
+--  ---------------------------------------------------------------------------
+--  NOTES
+--  ---------------------------------------------------------------------------
+--  * Transitions are per row - a layer always animates in with its own
+--    Transition In and out with its own Transition Out, including when it is
+--    shown or hidden as a side effect of a parent change.
+--  * Visibility is computed declaratively (a layer is visible when its enable
+--    is on AND every ancestor is visible) and then diffed against what was last
+--    pushed, so each Uci.SetLayerVisibility call happens only on a real change.
+--    Parent cycles are rejected at config time rather than trapped at runtime.
+--  * Leave a layer out of any Radio Group / Parent if an external script drives
+--    its enable pin directly, or the two will fight.
+--
+--  Revisions
+--    v0.9.10 UCI Name is a user pin (I/O), so the name can be driven from
+--          whatever already holds it instead of being typed a second time.
+--    v0.9.9  A Reset Group snap pulses Reassert.  It overwrites the requests
+--          of a whole group, which is exactly what that output is for, and
+--          leaving it silent meant nothing could recover the selection.
+--    v0.9.8  Apply no longer publishes over an enable pin holding a write
+--          nobody has read yet, so a batch of cross-component writes survives
+--          instead of collapsing to whichever one arrived first.
+--    v0.9.7  PIN Off is PERMISSION ONLY - it no longer raises what it ticks,
+--          so it can be filled in as the set a lock-free panel may reach
+--          without that set arriving all at once.  Default is now the only
+--          column that is a state as well as a permission.  A config reload
+--          pulses Reassert, so an edit reaches the scripts that own layers.
+--    v0.9.6  Status names a column that permits a layer but not its parent -
+--          the grid fault that shows up as a dark panel and nothing else.
+--    v0.9.5  A request refused by the live permission column is REMEMBERED
+--          rather than discarded, so a layer comes up the moment a column
+--          that permits it goes live instead of waiting on Reassert.
+--    v0.9.4  Publishes the reliable Reassert correction as a new plugin
+--          version so Q-SYS Designer recognises the in-place upgrade.
+--    v0.9.3  Fires the Reassert output with Control:Trigger(), so the pulse
+--          reaches external scripts on a real Core after permission changes.
+--    v0.9.2  Preserves requested layer state when Reset uses an unconfigured
+--          PIN Off column; widens and derives the configuration-grid layout.
+--    v0.9.1  PIN access.  Number of PIN Codes property; Pin Enabled, Pin
+--          Matched (input) / Pin Active (LED) / Unlocked (LED) and a Lock
+--          trigger; Default, PIN Off and PIN 1..N permission columns; every
+--          enable masked by the live column; sticky groups fall back to their
+--          first PERMITTED member.  Absorbs the lock that used to live in
+--          UCITextController - see UCITextController_V1.6.lua.
+--    v0.9  First release.  Replaces the Advanced UCI Controller in the
+--          designs it was written for, keeping its control names so a commissioned
+--          venue upgrades in place.  New: sticky radio groups, cycle-checked
+--          parent nesting, declarative visibility diffing.
+--
+--  ---------------------------------------------------------------------------
+--  ORIGIN AND LICENCE
+--  ---------------------------------------------------------------------------
+--  This plugin is a derivative of the Advanced UCI Controller:
+--
+--    Copyright (c) Callum Brieske / NSL NZ
+--    https://github.com/callumbrieske/Q-Sys-Advanced-UCI-Controller
+--    Released under the GNU General Public License v3.0
+--
+--  The runtime here has been substantially rewritten - the visibility model,
+--  the permission mask, the PIN layer and the whole configuration grid are new
+--  work - but it began as a drop-in replacement for that plugin in designs
+--  that were already running it, and it keeps its control names (enable,
+--  layer, radio group, parent, transition in/out, reset on parent, visible,
+--  uci, page, status, reset, logical parent) so that a commissioned venue
+--  upgrades without rewiring.  The transition and group-colour tables are
+--  carried over unchanged.  That makes it a derived work, and it is therefore
+--  distributed under the same licence.
+--
+--  Modifications copyright (c) 2026 Digital Counterpoint
+--
+--  This program is free software: you can redistribute it and/or modify it
+--  under the terms of the GNU General Public License as published by the Free
+--  Software Foundation, either version 3 of the License, or (at your option)
+--  any later version.
+--
+--  This program is distributed in the hope that it will be useful, but WITHOUT
+--  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+--  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+--  more details: https://www.gnu.org/licenses/gpl-3.0.html
+--#############################################################################
+
+PluginInfo = {
+  Name         = "Digital Counterpoint~Layer Controller",
+  Version      = "0.9.10",
+  BuildVersion = "0.9.10.0",
+  Id           = "fc4ec7a4-a093-4d22-a6fb-c9410166fe33",
+  Author       = "Digital Counterpoint",
+  Description  = "UCI layer visibility controller with radio groups, sticky radio groups, parent layers and PIN-gated access",
+  ShowDebug    = false
+}
+
+function GetColor(props)
+  return { 0, 0, 0 }
+end
+
+function GetPrettyName(props)
+  local cleanName = PluginInfo.Name:gsub(".*~", "")
+  return string.format("%s v%s", cleanName, PluginInfo.Version)
+end
+
+----------------------------------------------------------------
+--  Properties
+----------------------------------------------------------------
+--  NOTE: no apostrophes in property Name / Comment / Value - Q-SYS
+--  re-serialises these into single-quoted Lua and an apostrophe breaks the
+--  generated runtime script.  See docs/Claude/qsys-plugin-property-strings.md
+function GetProperties()
+  return {
+    -- Min is 2: with Count = 1 Q-SYS exposes a control as a scalar rather than
+    -- an array, and every grid column here is indexed.
+    { Name = "Number of Layers",     Type = "integer", Min = 2, Max = 128, Value = 8, Comment = "Number of configurable layer rows", Header = "Properties" },
+    -- One permission column per PIN code, and one Pin Matched input per code.
+    -- Min is 1 rather than 2 - a one-code pad is a real panel - so the runtime
+    -- has to cope with the Count = 1 scalar case for the two PIN arrays; see
+    -- AsArray.  Switch the whole feature off with the Pin Enabled toggle, not
+    -- by setting this to zero.
+    { Name = "Number of PIN Codes",  Type = "integer", Min = 1, Max = 8,   Value = 3, Comment = "Number of PIN codes the pad offers" }
+  }
+end
+
+function RectifyProperties(props)
+  return props
+end
+
+local function LayerCount(props)
+  local p = props and props["Number of Layers"]
+  local v = p and p.Value
+  if type(v) ~= "number" or v < 2 then return 8 end
+  return math.floor(v)
+end
+
+local function PinCount(props)
+  local p = props and props["Number of PIN Codes"]
+  local v = p and p.Value
+  if type(v) ~= "number" or v < 1 then return 3 end
+  return math.floor(v)
+end
+
+----------------------------------------------------------------
+--  Controls
+----------------------------------------------------------------
+function GetControls(props)
+  local n     = LayerCount(props)
+  local pins  = PinCount(props)
+  local ctrls = {}
+
+  ctrls[#ctrls + 1] = { Name = "reset",  ControlType = "Button", ButtonType = "Trigger", Count = 1, UserPin = true, PinStyle = "Both" }
+  --  UCI Name is pinned so a design names its UCI ONCE.  The Text Controller
+  --  already carries the same string on its UciName pin, and two hand-typed
+  --  copies of one name is a rename waiting to half-happen: the items go on
+  --  binding from the component's code name while every layer call here comes
+  --  back "uci, page or layer not found", which reads as a wrong LAYER name
+  --  and sends you to the wrong end of the design.  Drive this pin from
+  --  whatever already holds the name and the second copy stops existing.
+  --
+  --  "Both", not "Input".  The output side is what lets the name be READ back
+  --  out, which is the diagnosis this field is already used for - a green
+  --  Status means this string is the correct UCI name by definition, so it is
+  --  worth something to anything else that needs it.  Typing in the field
+  --  still works; last writer wins, and either way the change re-parses the
+  --  config through the handler below.
+  ctrls[#ctrls + 1] = { Name = "uci",    ControlType = "Text",   Count = 1, UserPin = true, PinStyle = "Both" }
+  ctrls[#ctrls + 1] = { Name = "page",   ControlType = "Text",   Count = 1 }
+  ctrls[#ctrls + 1] = { Name = "status", ControlType = "Indicator", IndicatorType = "Status", Count = 1 }
+
+  ctrls[#ctrls + 1] = { Name = "enable",          ControlType = "Button", ButtonType = "Toggle", Count = n, UserPin = true, PinStyle = "Both" }
+  ctrls[#ctrls + 1] = { Name = "layer",           ControlType = "Text",   Count = n }
+  ctrls[#ctrls + 1] = { Name = "logical parent",  ControlType = "Button", ButtonType = "Toggle", Count = n }
+  ctrls[#ctrls + 1] = { Name = "radio group",     ControlType = "Text",   Count = n }
+  ctrls[#ctrls + 1] = { Name = "sticky",          ControlType = "Button", ButtonType = "Toggle", Count = n }
+  ctrls[#ctrls + 1] = { Name = "parent",          ControlType = "Text",   Count = n }
+  ctrls[#ctrls + 1] = { Name = "transition in",   ControlType = "Text",   Count = n }
+  ctrls[#ctrls + 1] = { Name = "transition out",  ControlType = "Text",   Count = n }
+  ctrls[#ctrls + 1] = { Name = "reset on parent", ControlType = "Button", ButtonType = "Toggle", Count = n }
+  ctrls[#ctrls + 1] = { Name = "visible",         ControlType = "Indicator", IndicatorType = "Led", Count = n, UserPin = true, PinStyle = "Output" }
+
+  --  PIN access.
+  --
+  --  The two inputs are PinStyle "Input" deliberately: neither carries
+  --  anything back, so a bidirectional pin would only invite a second writer.
+  --  "lock" is a Trigger for the same reason the pad's logout is one - it has
+  --  no state to latch and no release edge to lose.
+  ctrls[#ctrls + 1] = { Name = "pin enabled", ControlType = "Button", ButtonType = "Toggle",  Count = 1,    UserPin = true, PinStyle = "Both" }
+  ctrls[#ctrls + 1] = { Name = "lock",        ControlType = "Button", ButtonType = "Trigger", Count = 1,    UserPin = true, PinStyle = "Input" }
+  ctrls[#ctrls + 1] = { Name = "pin matched", ControlType = "Button", ButtonType = "Toggle",  Count = pins, UserPin = true, PinStyle = "Input" }
+
+  --  Which code is live.  This is the state that used to be a Lua table inside
+  --  the venue's Text Controller: on an LED it is visible in Designer, it is
+  --  readable by anything else in the design, and it survives nothing - a
+  --  restart lands locked, which is the only safe place to land.
+  ctrls[#ctrls + 1] = { Name = "pin active",  ControlType = "Indicator", IndicatorType = "Led", Count = pins, UserPin = true, PinStyle = "Output" }
+  ctrls[#ctrls + 1] = { Name = "unlocked",    ControlType = "Indicator", IndicatorType = "Led", Count = 1,    UserPin = true, PinStyle = "Output" }
+
+  --  Pulsed whenever the plugin RE-SEEDS the enables from a state column - a
+  --  lock, a PIN Off transition, a Reset.  Anything else that drives enable
+  --  pins has just had its requests overwritten and must say again what it
+  --  wants.  'unlocked' is not enough on its own: Reset re-seeds without
+  --  moving it, and a layer nobody re-asserts then stays wherever the seed
+  --  left it until the next thing that happens to touch it.
+  ctrls[#ctrls + 1] = { Name = "reassert",    ControlType = "Button", ButtonType = "Trigger", Count = 1, UserPin = true, PinStyle = "Output" }
+
+  --  Permission columns.  Grid configuration, not pins - they are ticked once
+  --  at commissioning and read every time the live column changes.
+  ctrls[#ctrls + 1] = { Name = "allow default", ControlType = "Button", ButtonType = "Toggle", Count = n }
+  ctrls[#ctrls + 1] = { Name = "allow off",     ControlType = "Button", ButtonType = "Toggle", Count = n }
+  for k = 1, pins do
+    ctrls[#ctrls + 1] = { Name = "allow pin " .. k, ControlType = "Button", ButtonType = "Toggle", Count = n }
+  end
+
+  return ctrls
+end
+
+----------------------------------------------------------------
+--  Layout
+----------------------------------------------------------------
+--  Column geometry.  Each column's group box title doubles as its header, so a
+--  box has to be wide enough for the longest of (header text, cell content) -
+--  "Logical Parent" and "Reset Group" are what set the minimum on the narrow
+--  toggle columns, and layer names set it on Layer Name / Parent Layer.
+--
+--  Only the box widths below are authored; x positions are derived, so widening
+--  a column is a one-number edit and nothing downstream has to be re-tallied.
+--
+--    box  = width of the column's group box
+--    ctrl = width of the control inside it, centred.  Omit to fill the box
+--           less CELL_PAD each side.
+--    pair = the column holds two controls side by side (In / Out transitions);
+--           ctrl width is derived as half the usable width.
+local COL_GAP  = 4    -- gap between adjacent column group boxes
+local CELL_PAD = 6    -- inset from a group box edge to a filling control
+
+--  The permission block sits between Reset Group and Visible: it is
+--  configuration, so it belongs with the configuration, and Visible stays at
+--  the right-hand end where it has always been - it is the answer, not a
+--  setting.  Its width depends on the PIN count, so the spec is built per
+--  props rather than authored as a constant.
+local function ColumnSpec(pins)
+  local spec = {
+    { key = "enable",   box = 56,  ctrl = 40 },
+    { key = "name",     box = 132 },
+    { key = "logical",  box = 100, ctrl = 40 },
+    { key = "radio",    box = 110 },
+    { key = "sticky",   box = 60,  ctrl = 40 },
+    { key = "parent",   box = 148 },
+    { key = "trans",    box = 156, pair = true },
+    { key = "resetGrp", box = 92,  ctrl = 40 },
+    { key = "default",  box = 64,  ctrl = 40, title = "Default" },
+    { key = "off",      box = 64,  ctrl = 40, title = "PIN Off" },
+  }
+
+  for k = 1, pins do
+    spec[#spec + 1] = { key = "pin" .. k, box = 52, ctrl = 40, title = "PIN " .. k }
+  end
+
+  spec[#spec + 1] = { key = "visible", box = 62, ctrl = 16 }
+  return spec
+end
+
+--  { group box x, group box w, control x, control w }
+local function BuildColumns(pins)
+  local spec = ColumnSpec(pins)
+  local col  = {}
+  local x    = 0
+
+  for _, s in ipairs(spec) do
+    local w, cx
+    if s.pair then
+      w  = math.floor((s.box - (2 * CELL_PAD) - COL_GAP) / 2)
+      cx = x + CELL_PAD
+    else
+      w  = s.ctrl or (s.box - (2 * CELL_PAD))
+      cx = x + math.floor((s.box - w) / 2)
+    end
+    col[s.key] = { x, s.box, cx, w }
+    x = x + s.box + COL_GAP
+  end
+
+  return col, spec, col.visible[1] + col.visible[2]
+end
+
+--  Header height.  140 covered Setup and Guide; the PIN box adds a
+--  row per code, so it grows rather than clipping the last one.  Row k sits at
+--  y = 86 + 16k and is 16 tall, so the last row ends at 102 + 16 * pins; 8 more
+--  keeps it off the box edge.
+local function HeaderHeight(pins)
+  --  The floor is set by the SETUP GUIDE, not by the PIN box: 13 wrapped lines
+  --  at TextSize 8 need about 150 px and the guide is drawn into HEADER_H - 40.
+  --  The PIN box then adds a row per code on top of its four fixed rows.
+  return math.max(190, 130 + (16 * pins))
+end
+
+function GetControlLayout(props)
+  local n        = LayerCount(props)
+  local pins     = PinCount(props)
+  local layout   = {}
+  local graphics = {}
+
+  local COL, COL_SPEC, TOTAL_W = BuildColumns(pins)
+  local HEADER_H = HeaderHeight(pins)
+  local GRID_Y   = HEADER_H + 2   -- top of the configuration grid group boxes
+  local ROW_Y    = GRID_Y + 5     -- first grid row sits at ROW_Y + 16
+
+  local function label(text, x, y, w, h, size, align)
+    graphics[#graphics + 1] = {
+      Type = "Label", Text = text,
+      HTextAlign = align or "Right", VTextAlign = "Center",
+      Position = { x, y }, Size = { w, h }, TextSize = size or 10,
+    }
+  end
+
+  local function groupBox(text, x, y, w, h, align)
+    graphics[#graphics + 1] = {
+      Type = "GroupBox", Text = text,
+      HTextAlign = align or "Center",
+      StrokeWidth = 1, CornerRadius = 8,
+      Position = { x, y }, Size = { w, h }, TextSize = 12,
+    }
+  end
+
+  --------------------------------------------------------------
+  --  Setup
+  --------------------------------------------------------------
+  groupBox("Setup", 0, 0, 204, HEADER_H, "Left")
+  local setupRows = {
+    { key = "reset",  text = "Reset Layers", y = 26, h = 16, style = "Button", pretty = "Reset Layers" },
+    { key = "uci",    text = "UCI Name",     y = 46, h = 16, style = "Text",   pretty = "UCI Name" },
+    { key = "page",   text = "UCI Page",     y = 66, h = 16, style = "Text",   pretty = "UCI Page" },
+    { key = "status", text = "Status",       y = 86, h = 46, style = "Text",   pretty = "Status" },
+  }
+  for _, r in ipairs(setupRows) do
+    label(r.text, 6, r.y, 68, r.h)
+    layout[r.key] = {
+      Style = r.style, Size = { 122, r.h }, Position = { 76, r.y },
+      HTextAlign = "Center", PrettyName = r.pretty, Margin = 0, Radius = 0,
+    }
+  end
+
+  --------------------------------------------------------------
+  --  PIN access
+  --------------------------------------------------------------
+  groupBox("PIN Access", 208, 0, 204, HEADER_H, "Left")
+
+  local pinRows = {
+    { key = "pin enabled", text = "Enabled",  y = 26, style = "Button", pretty = "PIN Enabled" },
+    { key = "lock",        text = "Lock",     y = 46, style = "Button", pretty = "Lock" },
+    { key = "unlocked",    text = "Unlocked", y = 66, style = "Led",    pretty = "Unlocked" },
+    { key = "reassert",    text = "Reassert", y = 86, style = "Button", pretty = "Reassert" },
+  }
+  for _, r in ipairs(pinRows) do
+    label(r.text, 214, r.y, 68, 16)
+    layout[r.key] = {
+      Style = r.style, Size = { r.style == "Led" and 16 or 122, 16 },
+      Position = { r.style == "Led" and 284 or 284, r.y },
+      HTextAlign = "Center", PrettyName = r.pretty, Margin = 0, Radius = 0,
+    }
+  end
+
+  --  One row per code: the input that says a match happened, and the LED that
+  --  says which code the panel is currently open on.
+  label("Matched", 264, 106, 56, 14, 8, "Center")
+  label("Live",    326, 106, 30, 14, 8, "Center")
+
+  --  A Count = 1 control is laid out under its BARE name, NOT name .. " 1" -
+  --  the same rule that makes it a scalar at runtime.  QList spells this out:
+  --  externalTime is Count = 1 and its layout key is layout["externalTime"].
+  --  Get it wrong and the control is simply absent from the plugin UI, with no
+  --  error anywhere, on exactly the one-PIN panels least likely to be tested.
+  local function pinKey(base, k)
+    return (pins == 1) and base or (base .. " " .. k)
+  end
+
+  for k = 1, pins do
+    local y = 106 + (16 * k)
+    label("PIN " .. k, 214, y, 46, 16)
+    layout[pinKey("pin matched", k)] = {
+      Style = "Button", ButtonStyle = "Toggle", Color = "grey",
+      Size = { 56, 16 }, Position = { 264, y },
+      PrettyName = "PIN " .. k .. "~Matched",
+    }
+    layout[pinKey("pin active", k)] = {
+      Style = "Led",
+      Size = { 16, 16 }, Position = { 333, y },
+      PrettyName = "PIN " .. k .. "~Active",
+    }
+  end
+
+  --------------------------------------------------------------
+  --  Setup guide
+  --------------------------------------------------------------
+  groupBox("Setup Guide", 416, 0, TOTAL_W - 416, HEADER_H, "Right")
+  graphics[#graphics + 1] = {
+    Type = "Label",
+    Text = [[
+1. Enter the UCI and page you want to control.
+2. Name the layers you want to drive, one per row.
+3. Give rows a shared Radio Group name to make them mutually exclusive. Any name works.
+4. Tick Sticky so a group can never end up empty - re-pressing the live member keeps it selected,
+    and an empty group falls back to its first PERMITTED row. Set it on the group's first row.
+5. Choose a Parent Layer to nest a row. It is only shown when its parent is. Loops are rejected.
+6. Reset Group returns a group to its first member each time its parent is shown.
+7. Logical Parent makes a row a grouping handle with no layer of its own - use it to gate
+    children from a selection that has no layer to hang off.
+8. Default is what you get on load and while LOCKED, and it is the ONLY column that is a
+    state as well as a permission - entering it writes the Enable column to match.
+9. PIN Off and PIN 1..n are PERMISSION ONLY. Tick them with all that role may REACH: an
+    unticked layer is forced down, a ticked one is only allowed and still needs raising.
+10. An EMPTY column: PIN Off permits everything; Default and PIN 1..n permit NOTHING, being
+    a lock. Status names the empty one rather than leaving you at a dark panel.
+11. A column permitting a layer but not its PARENT can never show it - enable true, visible
+    false. Status names the parent row to tick.]],
+    HTextAlign = "Left", VTextAlign = "Top",
+    Position = { 422, 22 }, Size = { TOTAL_W - 428, HEADER_H - 40 }, TextSize = 8,
+  }
+  label(string.format("Digital Counterpoint v%s  -  GPL-3.0, after Advanced UCI Controller by Callum Brieske / NSL NZ", PluginInfo.Version),
+        422, HEADER_H - 22, TOTAL_W - 428, 16, 8, "Center")
+
+  --------------------------------------------------------------
+  --  Configuration grid
+  --------------------------------------------------------------
+  local gridH = 28 + (n * 16)
+  local GRID_TITLES = {
+    enable = "Enable", name = "Layer Name", logical = "Logical Parent",
+    radio = "Radio Group", sticky = "Sticky", parent = "Parent Layer",
+    trans = "In - Trans - Out", resetGrp = "Reset Group", visible = "Visible",
+  }
+  for _, spec in ipairs(COL_SPEC) do
+    local c = COL[spec.key]
+    groupBox(spec.title or GRID_TITLES[spec.key], c[1], GRID_Y, c[2], gridH)
+  end
+
+  for c = 1, n do
+    local y = ROW_Y + (16 * c)
+
+    layout["enable " .. c] = {
+      Style = "Button", ButtonStyle = "Toggle", Legend = tostring(c), Color = "grey",
+      Size = { COL.enable[4], 16 }, Position = { COL.enable[3], y },
+      PrettyName = "Layer " .. c .. "~Enable",
+    }
+    layout["layer " .. c] = {
+      Style = "Text",
+      Size = { COL.name[4], 16 }, Position = { COL.name[3], y },
+      PrettyName = "Layer " .. c .. " Name",
+    }
+    layout["logical parent " .. c] = {
+      Style = "Button", ButtonStyle = "Toggle", Color = "grey",
+      Size = { COL.logical[4], 16 }, Position = { COL.logical[3], y },
+      PrettyName = "Layer " .. c .. " Logical Parent",
+    }
+    layout["radio group " .. c] = {
+      Style = "Text",
+      Size = { COL.radio[4], 16 }, Position = { COL.radio[3], y },
+      PrettyName = "Layer " .. c .. " Radio Group",
+    }
+    layout["sticky " .. c] = {
+      Style = "Button", ButtonStyle = "Toggle", Color = "grey",
+      Size = { COL.sticky[4], 16 }, Position = { COL.sticky[3], y },
+      PrettyName = "Layer " .. c .. " Sticky Radio Group",
+    }
+    layout["parent " .. c] = {
+      Style = "ComboBox",
+      Size = { COL.parent[4], 16 }, Position = { COL.parent[3], y },
+      PrettyName = "Layer " .. c .. " Parent Layer",
+    }
+    layout["transition in " .. c] = {
+      Style = "ComboBox",
+      Size = { COL.trans[4], 16 }, Position = { COL.trans[3], y },
+      PrettyName = "Layer " .. c .. " Transition In",
+    }
+    layout["transition out " .. c] = {
+      Style = "ComboBox",
+      Size = { COL.trans[4], 16 }, Position = { COL.trans[3] + COL.trans[4] + 4, y },
+      PrettyName = "Layer " .. c .. " Transition Out",
+    }
+    layout["reset on parent " .. c] = {
+      Style = "Button", ButtonStyle = "Toggle", Color = "grey",
+      Size = { COL.resetGrp[4], 16 }, Position = { COL.resetGrp[3], y },
+      PrettyName = "Layer " .. c .. " Reset Group on Parent Change",
+    }
+    layout["allow default " .. c] = {
+      --  Legended with the row number, like the Enable column at the far left.
+      --  At 32 rows the permission block is a thousand pixels from the layer
+      --  name and is otherwise five identical grey squares.
+      Style = "Button", ButtonStyle = "Toggle", Color = "grey", Legend = tostring(c),
+      Size = { COL.default[4], 16 }, Position = { COL.default[3], y },
+      PrettyName = "Layer " .. c .. " Allowed by Default",
+    }
+    layout["allow off " .. c] = {
+      Style = "Button", ButtonStyle = "Toggle", Color = "grey",
+      Size = { COL.off[4], 16 }, Position = { COL.off[3], y },
+      PrettyName = "Layer " .. c .. " Allowed with PIN Off",
+    }
+    for k = 1, pins do
+      local col = COL["pin" .. k]
+      layout["allow pin " .. k .. " " .. c] = {
+        Style = "Button", ButtonStyle = "Toggle", Color = "grey",
+        Size = { col[4], 16 }, Position = { col[3], y },
+        PrettyName = "Layer " .. c .. " Allowed by PIN " .. k,
+      }
+    end
+    layout["visible " .. c] = {
+      Style = "Led",
+      Size = { COL.visible[4], 16 }, Position = { COL.visible[3], y },
+      PrettyName = "Layer " .. c .. "~Visible",
+    }
+  end
+
+  return layout, graphics
+end
+
+----------------------------------------------------------------
+--  Runtime
+----------------------------------------------------------------
+if Controls then
+
+--  Q-SYS transition keywords, and the friendly names shown in the combo boxes.
+local TRANSITIONS = {
+  { friendly = "None",   value = nil },
+  { friendly = "Fade",   value = "fade" },
+  { friendly = "Left",   value = "left" },
+  { friendly = "Right",  value = "right" },
+  { friendly = "Top",    value = "top" },
+  { friendly = "Bottom", value = "bottom" },
+}
+
+local TRANSITION_NAMES = {}
+for i, t in ipairs(TRANSITIONS) do TRANSITION_NAMES[i] = t.friendly end
+
+--  Deterministic palette used to colour-code the Radio Group cells so grouped
+--  rows are obvious at a glance.
+local GROUP_COLORS = { "red", "orange", "yellow", "green", "blue", "purple", "pink", "aqua" }
+
+local STATUS_OK, STATUS_FAULT, STATUS_NOT_PRESENT = 0, 2, 3
+
+local layerCount = #Controls.enable
+
+--  Parsed configuration.  Rebuilt from the grid on every edit.
+local cfg = {
+  uci        = "",
+  page       = "",
+  rows       = {},   -- [i] = row record, only for populated rows
+  byName     = {},   -- layer name -> row index
+  groups     = {},   -- group name -> { members = {i,...}, sticky, resetOnParent }
+  groupOrder = {},   -- group names in grid order, for stable colouring
+  ok         = false,
+}
+
+local applied      = {}  -- [i] = visibility last pushed to the UCI
+local appliedName  = {}  -- [i] = the LAYER NAME that visibility was pushed to
+local parentWasUp  = {}  -- [group name] = parent visibility at the last evaluation
+
+--  Guards SYNCHRONOUS reentry only - LoadConfig writing a control whose own
+--  handler calls LoadConfig again.  It does NOTHING for the plugin's own
+--  enable writes, whose events arrive on a later frame with this already back
+--  to false; that is what `shown` below is for.
+local reentrant    = false
+
+--------------------------------------------------------------
+--  PIN access
+--------------------------------------------------------------
+--  Q-SYS exposes a Count = 1 control as a SCALAR, not a one-element array -
+--  the same rule that forces Number of Layers to a minimum of 2.  PIN codes
+--  genuinely can be 1 (a one-code panel is a real panel), so the two PIN
+--  arrays are normalised here instead and every reader indexes them.
+local function AsArray(ctrl)
+  if ctrl == nil then return {} end
+  local ok, first = pcall(function() return ctrl[1] end)
+  if ok and first ~= nil then return ctrl end
+  return { ctrl }
+end
+
+local pinMatch = AsArray(Controls["pin matched"])
+local pinLed   = AsArray(Controls["pin active"])
+local pinCount = #pinLed
+
+--  The edge detector is armed HERE, at chunk load, and not down in the startup
+--  block - before any handler exists, so there is no window in which a level
+--  that was already high can be read as a fresh rising edge.  A design that
+--  boots with pin.match.N still latched from the last session starts LOCKED,
+--  which is the only safe place to start.
+local matchWas = {}
+for k = 1, pinCount do matchWas[k] = pinMatch[k].Boolean and true or false end
+
+--  The permission columns, resolved once.  defCol / offCol are STATE as well
+--  as permission - entering one writes the enables to match.  pinCol[k] is a
+--  mask and nothing else.
+local defCol = Controls["allow default"]
+local offCol = Controls["allow off"]
+local pinCol = {}
+for k = 1, pinCount do pinCol[k] = Controls["allow pin " .. k] end
+
+--  requested[] is the model's memory and Controls.enable is its OUTPUT.  The
+--  two are not the same thing: a row the live column forbids is written false
+--  while its request stays true, so the layer comes back the moment a column
+--  that permits it becomes live.  That is what lets an external script say
+--  what the venue WANTS without knowing who is logged in.
+local requested = {}   -- [i] = what the enable pin has been ASKED to be
+local shown     = {}   -- [i] = the value Apply last WROTE to Controls.enable[i]
+--  [i] = the control value already ACCOUNTED FOR.  Not the same thing as
+--  shown[]: a press or a script write moves the control without this plugin
+--  writing it, and the difference between the two is the whole point.
+--
+--    control ~= seen[i]   an external write NOBODY HAS READ YET
+--    control ~= shown[i]  the control is not where we last put it
+--
+--  shown[] is what a refused press snaps back to; seen[] is what stops Apply
+--  publishing over a request that has not been delivered yet.  Conflating them
+--  makes the snap-back restore the very value it is meant to refuse.
+local seen      = {}
+local activePin = nil  -- which PIN column is live; nil = locked, or PIN off
+local liveCol   = defCol  -- the live permission column, resolved every Apply
+local colKey    = nil  -- and its identity
+local liveOpen  = false   -- true when the live column is blank AND fails open
+local seededKey = nil  -- the column the requests were last seeded from
+
+--------------------------------------------------------------
+--  Status helpers
+--------------------------------------------------------------
+local function SetStatus(level, text)
+  Controls.status.Value  = level
+  Controls.status.String = text or ""
+end
+
+local function TransitionValue(friendly)
+  for _, t in ipairs(TRANSITIONS) do
+    if t.friendly == friendly then return t.value end
+  end
+  return nil
+end
+
+--------------------------------------------------------------
+--  Permissions
+--------------------------------------------------------------
+local function ColumnHasTicks(col)
+  if not col then return false end
+  for i = 1, layerCount do
+    local c = col[i]
+    if c and c.Boolean then return true end
+  end
+  return false
+end
+
+--  The live column, and an identity for it so a change can be detected.
+--  Resolved ONCE per Apply: reading it again mid-pass would let a `pin matched`
+--  edge arriving between two reads split one pass across two permission sets.
+local function LiveColumn()
+  if not Controls["pin enabled"].Boolean then return offCol, "off" end
+  if activePin and pinCol[activePin] then return pinCol[activePin], "pin" .. activePin end
+  return defCol, "default"
+end
+
+--  An EMPTY column is an unconfigured one, and the two cases want opposite
+--  answers:
+--
+--    PIN Off   fails OPEN.  Pin Enabled starts false, so an untouched v0.9
+--              design upgrades to v0.9.1 and behaves exactly as it did.
+--    Default   fails CLOSED, and so does every PIN column.  These are the
+--              locked state and the per-code grants of a security feature; a
+--              blank one that permitted everything would be a lock that had
+--              quietly stopped locking.  A dark panel is the loud version, and
+--              Status names the column.
+--  liveOpen is resolved ONCE per pass by Apply, not recomputed here: this sits
+--  three levels inside EffectiveVisible's recursion, and a whole-column scan at
+--  128 rows would be O(rows^2 x depth) on every script write.
+local function Permitted(i)
+  if liveOpen then return true end
+  local c = liveCol and liveCol[i]
+  return (c ~= nil) and c.Boolean or false
+end
+
+--  What the enable pin SHOULD read: the request, masked by the live column.
+local function Enabled(i)
+  return (requested[i] and Permitted(i)) or false
+end
+
+--  Resolve the live column and cache the fail-open answer for this pass.
+--  Reading LiveColumn() again mid-pass would let a 'pin matched' edge arriving
+--  between two reads split one pass across two permission sets.
+local function ResolveColumn()
+  local col, key = LiveColumn()
+  liveCol  = col
+  colKey   = key
+  liveOpen = (key == "off") and not ColumnHasTicks(col)
+end
+
+--  Entering Default or PIN Off writes the requests to match that column - it
+--  is a state as well as a permission, which is what puts the login screen
+--  back on a logout.  A BLANK column seeds nothing: it has not been configured,
+--  and wiping every request from it would be a silent panel-wide clear.
+local function SeedFrom(col)
+  if not ColumnHasTicks(col) then return end
+  for i = 1, layerCount do
+    local c = col[i]
+    requested[i] = (cfg.rows[i] ~= nil) and (c ~= nil) and c.Boolean or false
+  end
+end
+
+--  "The permission set has moved - say again what you want."
+--
+--  Pulsed on every change of the live column, NOT only when one is seeded.
+--  Widening the mask raises nothing by itself, which is the whole point of a
+--  permission column - so a login straight from one code into another, with no
+--  lock in between, would otherwise leave every newly-permitted layer down with
+--  nothing to put it up.  Found with the Text Controller running against this
+--  plugin: PIN 1 then PIN 2 left Options masked-in and unrequested.
+local function Reassert()
+  -- This is an OUTPUT TRIGGER, not a Boolean state. Boolean writes appeared to
+  -- pulse it in the test double but do not publish a trigger edge reliably on
+  -- a Core. Use the Q-SYS output-control API so Component.New subscribers and
+  -- a wired destination both receive the event. Keep the Boolean pulse only as
+  -- a guarded compatibility fallback: an older runtime refusing Trigger()
+  -- must not abort Apply and take every layer handler down with it.
+  local ok = pcall(function() Controls.reassert:Trigger() end)
+  if not ok then
+    Controls.reassert.Boolean = true
+    Controls.reassert.Boolean = false
+  end
+end
+
+--  Controls.enable is written by the plugin on every pass, and a plugin writing
+--  its own control RE-ENTERS THE SAME HANDLER CHAIN SYNCHRONOUSLY.  That is not
+--  a guess: Plugins/VenueModeSelector/CHANGELOG.md [1.2.1] records it as the
+--  root cause of a radio group that could show two buttons lit at once under
+--  load, fixed with exactly this kind of guard.
+--
+--  So the write below lands back in OnEnablePressed before SetEnable returns.
+--  Read as a press it would set requested[i] = false the instant a row was
+--  masked out - destroying the very thing the mask exists to remember - and
+--  OnEnablePressed would call Apply again from inside Apply.
+--
+--  `reentrant` does not cover it: that guards LoadConfig, and Apply runs
+--  outside it.  A press always moves the control AWAY from what is on screen,
+--  so "the value arriving is the value we last wrote" is a complete test.  A
+--  counter would not be: a write that does not change the value emits no event
+--  at all, so the count would drift and swallow a later real press.
+local function SetEnable(i, v)
+  shown[i] = v
+  seen[i]  = v          -- we are the writer, so there is nothing unread here
+  if Controls.enable[i].Boolean ~= v then Controls.enable[i].Boolean = v end
+end
+
+--------------------------------------------------------------
+--  Visibility
+--------------------------------------------------------------
+--  A row is visible when its own enable is on AND every ancestor is visible.
+--  `seen` guards against a parent loop that slipped past validation.
+--
+--  Enabled(i), not Controls.enable[i]: Apply computes visibility BEFORE it
+--  writes the enables, so the control is a pass out of date and requested[]
+--  is not.
+local function EffectiveVisible(i, seen)
+  local row = cfg.rows[i]
+  if not row then return false end
+  if not Enabled(i) then return false end
+  if row.parent == "" then return true end
+
+  local p = cfg.byName[row.parent]
+  if not p then return true end          -- unresolved parent does not gate
+
+  seen = seen or {}
+  if seen[i] then return false end
+  seen[i] = true
+  return EffectiveVisible(p, seen)
+end
+
+local function PushVisibility(i, want, force)
+  local row = cfg.rows[i]
+
+  --  Guarded.  'visible' is an OUTPUT pin that other scripts gate real work on
+  --  - a venue Text Controller may drive a whole layer off this one - and an
+  --  unguarded write notifies on every Apply whether or not the layer moved.
+  --  That is a burst of updates per press at best, and at worst a loop: a
+  --  listener that writes an enable in response re-enters Apply, which writes
+  --  visible again.  Found exactly that way, with the two halves running
+  --  together in the Text Controller's harness.
+  if Controls.visible[i].Boolean ~= want then
+    Controls.visible[i].Boolean = want
+  end
+
+  if row.logical then return end         -- logical rows have no real layer
+  if not force and applied[i] == want then return end
+
+  --  NOT `want and row.transIn or row.transOut`.  "None" is a real choice and
+  --  TransitionValue returns nil for it, so that expression falls through to
+  --  the OUT transition whenever Transition In is None or blank - a row with
+  --  only the Out box filled animated IN with its hide animation.  And
+  --  `force and nil` is nil for every force, so the or-arm always ran and a
+  --  forced push never suppressed its transition either.
+  local transition
+  if not force then
+    if want then transition = row.transIn else transition = row.transOut end
+  end
+  local ok, err = pcall(function()
+    Uci.SetLayerVisibility(cfg.uci, cfg.page, row.name, want, transition)
+  end)
+
+  if ok then
+    applied[i]     = want
+    appliedName[i] = row.name
+  else
+    local detail = tostring(err):match(":%d+: (.*)") or tostring(err)
+    if detail == "uci, page or layer not found" then
+      SetStatus(STATUS_FAULT, string.format("Row %d: UCI, page or layer \"%s\" not found", i, row.name))
+    else
+      SetStatus(STATUS_FAULT, string.format("Row %d: %s", i, detail))
+    end
+  end
+end
+
+--  Snap any group flagged Reset Group back to its first member on the rising
+--  edge of its parent becoming visible.
+--  Returns whether it actually SNAPPED a group, so Apply can say so.
+local function ApplyGroupResets()
+  local snapped = false
+
+  for _, name in ipairs(cfg.groupOrder) do
+    local g = cfg.groups[name]
+    if g.resetOnParent and #g.members > 0 then
+      local first = g.members[1]
+      local prow  = cfg.rows[first]
+      local p     = prow and prow.parent ~= "" and cfg.byName[prow.parent] or nil
+      if p then
+        local up = EffectiveVisible(p)
+        if up and parentWasUp[name] == false then
+          for idx, m in ipairs(g.members) do
+            requested[m] = (idx == 1)
+          end
+          snapped = true
+        end
+        parentWasUp[name] = up
+      end
+    end
+  end
+
+  return snapped
+end
+
+--  Prime the parent-visibility edge detector to the state that exists RIGHT
+--  NOW, so a freshly seeded column is not snapped straight back to member 1 by
+--  a Reset Group edge that is really only "we have just started looking".
+local function PrimeParentEdges()
+  for _, name in ipairs(cfg.groupOrder) do
+    local g     = cfg.groups[name]
+    local first = g.members[1]
+    local prow  = first and cfg.rows[first]
+    local p     = prow and prow.parent ~= "" and cfg.byName[prow.parent] or nil
+    parentWasUp[name] = (p ~= nil) and EffectiveVisible(p) or false
+  end
+end
+
+--  A sticky group is never allowed to sit empty - and since v0.9.1 "empty"
+--  means empty AFTER MASKING.  A group whose selection the live column forbids
+--  re-selects its first PERMITTED member, and that single rule is the whole
+--  login swap: one sticky pair with Login ticked under Default and Lock ticked
+--  under every PIN column changes over by itself, with no per-code state
+--  anywhere and nothing writing the enables from outside.
+--
+--  If NO member is permitted the group goes dark, which is correct: the live
+--  column has forbidden the lot.
+local function EnforceSticky()
+  for _, name in ipairs(cfg.groupOrder) do
+    local g = cfg.groups[name]
+    if g.sticky and #g.members > 0 then
+      local anyOn = false
+      for _, m in ipairs(g.members) do
+        if Enabled(m) then anyOn = true break end
+      end
+      if not anyOn then
+        for _, m in ipairs(g.members) do
+          if Permitted(m) then
+            --  Clear the others as well.  Without that, a login straight from
+            --  one code into another with no lock in between leaves two
+            --  members requested, and a column permitting both shows both.
+            for _, other in ipairs(g.members) do requested[other] = (other == m) end
+            break
+          end
+        end
+      end
+    end
+  end
+end
+
+--  Keep the first LIVE member of each group and clear the rest.  The rule the
+--  config loader used to apply to Controls.enable, now applied to requested[]
+--  and shared, because a column seed can tick two members of one group.
+--
+--  Only live members are cleared, so a remembered request that the mask is
+--  currently hiding survives to be honoured when its column comes back.
+local function ExclusiveGroups()
+  for _, name in ipairs(cfg.groupOrder) do
+    local taken = false
+    for _, m in ipairs(cfg.groups[name].members) do
+      if Enabled(m) then
+        if taken then requested[m] = false else taken = true end
+      end
+    end
+  end
+end
+
+--  The PIN state goes out ahead of every guard below.  A duplicate layer name
+--  stops layer control, but it must not freeze 'unlocked'
+--  and 'pin active': the venue script and the panel dimmer read those, and a
+--  config typo that silently stranded a panel in its last lock state would be
+--  the worst possible way to find out about it.
+local function PublishPinState()
+  --  Guarded: this runs on every Apply, and Q-SYS notifies on a write whether
+  --  or not the value moved.  Unguarded it is pinCount + 1 spurious control
+  --  updates per press, fanned out to everything watching them.
+  for k = 1, pinCount do
+    local want = (activePin == k)
+    if pinLed[k].Boolean ~= want then pinLed[k].Boolean = want end
+  end
+  local open = (not Controls["pin enabled"].Boolean) or (activePin ~= nil)
+  if Controls.unlocked.Boolean ~= open then Controls.unlocked.Boolean = open end
+end
+
+local function Apply(force)
+  PublishPinState()
+
+  --  1. Resolve the live column BEFORE the guards below, never after.  A press
+  --     is judged against liveCol/liveOpen by OnEnablePressed, which runs
+  --     outside this function - so leaving them stale through an early return
+  --     would have a config fault judge the next press against whatever
+  --     column happened to be live before it.
+  ResolveColumn()
+
+  if not cfg.ok then return end
+
+  --  2. Entering Default or PIN Off SEEDS the requests; entering a PIN column
+  --     seeds nothing at all - it only widens the mask.  That asymmetry is the
+  --     agreed contract: a PIN says who may see a layer, never that it should
+  --     be shown, so it can never race whatever else is driving the enables.
+  --  Note the pulse itself is DEFERRED to the end of this function.  Anything
+  --  listening has to see the world the new column produced, not the one it
+  --  replaced - fire it here and a listener that asks "is my layer up" reads
+  --  the enables from before the mask moved and answers about the last login.
+  local moved = (colKey ~= seededKey)
+  if moved then
+    seededKey = colKey
+    if colKey == "default" then
+      SeedFrom(liveCol)
+      PrimeParentEdges()   -- the seed wins over a first-pass Reset Group edge
+    end
+  end
+
+  --  3. STICKY FIRST, and this order is load-bearing.  ApplyGroupResets asks
+  --     "is my parent visible", and under v0.9.1 sticky is often the thing that
+  --     makes it visible - a login masks the old selection out, the group falls
+  --     to its first permitted member, and THAT is the parent coming up.  Ask
+  --     before sticky has run and the rising edge is missed, then fires on the
+  --     next Apply instead: usually the operator's next press, which it
+  --     silently overwrites with the group's first member.
+  EnforceSticky()
+  --  4. Now the parent states are real, so a Reset Group edge is a true one.
+  --     It can still snap a group to a member the live column forbids ...
+  local snapped = ApplyGroupResets()
+  --  5. ... so sticky runs again to repair that, choosing the first PERMITTED
+  --     member.  Cheap - it only writes when a group is empty after masking.
+  EnforceSticky()
+  --  6. Last line of defence: a seed, or two logins with no lock between them,
+  --     can leave two members of one group requested.
+  ExclusiveGroups()
+
+  --  7. Publish the masked enables.  Every write goes through SetEnable, which
+  --     records what it wrote first - the handler re-enters SYNCHRONOUSLY, from
+  --     inside this loop, and must not read our own write as a press.
+  --  DO NOT PUBLISH OVER AN UNREAD WRITE.  A Core delivers a script's
+  --  cross-component writes as VALUES first and runs the receiving handlers
+  --  afterwards, so while this loop runs there can be enable pins already
+  --  holding a request nobody has read.  Publishing over one destroys it, and
+  --  the echo guard then discards its handler when it finally arrives - so the
+  --  write is gone without ever having been seen, and a batch of N writes
+  --  collapses to whichever was delivered first.  That is what made a venue
+  --  mode change move one layer and drop the rest.
+  --
+  --  Skipping costs nothing: the pending handler is guaranteed to run,
+  --  OnEnablePressed records the request, and Apply runs again from there and
+  --  settles the row one frame later.  The MASK is not weakened - visibility is
+  --  computed from Enabled(), never from the pin - so an unread write can leave
+  --  a pin briefly lit but can never show a layer its column forbids.
+  for i = 1, layerCount do
+    if Controls.enable[i].Boolean == seen[i] then
+      SetEnable(i, (cfg.rows[i] ~= nil) and Enabled(i) or false)
+    end
+  end
+
+  --  8. Snapshot first, then HIDE BEFORE SHOW.  v0.9 iterated pairs(cfg.rows),
+  --     whose order is undefined - invisible when one layer moves, obvious the
+  --     first time a login moves four at once and the incoming layer fades in
+  --     over the outgoing one, differently on each run.
+  local want = {}
+  for i = 1, layerCount do
+    if cfg.rows[i] then want[i] = EffectiveVisible(i) end
+  end
+  for i = 1, layerCount do
+    if cfg.rows[i] and not want[i] then PushVisibility(i, false, force) end
+  end
+  for i = 1, layerCount do
+    if cfg.rows[i] and want[i] then PushVisibility(i, true, force) end
+  end
+
+  --  9. LAST.  Every enable and every layer now reflects the live column, so a
+  --     listener woken by this reads a settled world.
+  --  A Reset Group snap OVERWRITES the requests of every member of that group,
+  --  which is the one thing Reassert exists to announce - so it announces it.
+  --
+  --  Without this the snap is silent, and a venue script cannot recover from
+  --  it: the layer it wanted was already up when it last spoke, so its write
+  --  changed no value and carried no information, and the snap then took the
+  --  selection away underneath it.  Found on a ship's muster drill, which drops a
+  --  Logical Parent and raises it again - a real parent edge, so a real snap -
+  --  landing the panel on the group's first PERMITTED member instead of the
+  --  view it was on.
+  if moved or snapped then Reassert() end
+end
+
+--------------------------------------------------------------
+--  Configuration
+--------------------------------------------------------------
+--  Valid parents for row i: any other populated, non-blank row that is not in
+--  the same radio group and is not a descendant of i (which would be a loop).
+local function IsDescendantOf(candidate, ancestor, names, parents)
+  local guard = 0
+  local at    = candidate
+  while at and guard <= layerCount do
+    if at == ancestor then return true end
+    local pname = parents[at]
+    at = (pname and pname ~= "") and names[pname] or nil
+    guard = guard + 1
+  end
+  return false
+end
+
+local function RebuildParentChoices(names, parents, radios)
+  for i = 1, layerCount do
+    local ctrl    = Controls.parent[i]
+    local current = ctrl.String
+    local choices = { "" }
+
+    if Controls.layer[i].String ~= "" then
+      for q = 1, layerCount do
+        local candidate = Controls.layer[q].String
+        if q ~= i and candidate ~= ""
+           and not (radios[i] ~= "" and radios[i] == radios[q])
+           and not IsDescendantOf(q, i, names, parents)
+        then
+          choices[#choices + 1] = candidate
+        end
+      end
+    end
+
+    ctrl.Choices = choices
+    -- Reassigning Choices can drop a selection that is no longer offered.
+    local stillValid = false
+    for _, v in ipairs(choices) do
+      if v == current then stillValid = true break end
+    end
+    ctrl.String = stillValid and current or ""
+  end
+end
+
+--  The first PIN column with no ticks at all, or nil.  Fails closed like
+--  Default, so an unconfigured code is a code that grants nothing - which is
+--  the right way round for a security column and the wrong thing to discover
+--  on site.
+local function EmptyPinColumn()
+  for k = 1, pinCount do
+    if not ColumnHasTicks(pinCol[k]) then return k end
+  end
+  return nil
+end
+
+local function CountRows()
+  local n = 0
+  for _ in pairs(cfg.rows) do n = n + 1 end
+  return n
+end
+
+--  A column that permits a CHILD but not its PARENT can never show that child.
+--  Nothing at runtime reports it: the child's enable goes true, its visible
+--  stays false, and the panel is dark behind a green Status and a correct
+--  looking Enable column.  Completely obvious in the grid once you know to
+--  look, and completely invisible until then - so the grid says it out loud.
+--
+--  Worst with a Logical Parent, which draws nothing and so has no symptom of
+--  its own.  Two commissioning sessions went on a single gate row
+--  that was ticked in some columns and not others.
+--
+--  Reported as the BLOCKING ANCESTOR and how many rows it strands, not as the
+--  first stranded child: one missing tick usually strands twenty rows, and the
+--  ancestor is the thing to go and tick.  Returns nil when the column is sound.
+local function BlockedByColumn(col)
+  if not col then return nil end
+  local count = {}          -- [ancestor row] = how many rows it strands
+  local worst, worstN
+
+  for i = 1, layerCount do
+    local row = cfg.rows[i]
+    local c   = col[i]
+    if row and c and c.Boolean and row.parent ~= "" then
+      local at, guard = cfg.byName[row.parent], 0
+      while at and guard <= layerCount do
+        local pc = col[at]
+        if not (pc and pc.Boolean) then
+          count[at] = (count[at] or 0) + 1
+          if not worstN or count[at] > worstN then worst, worstN = at, count[at] end
+          break
+        end
+        local prow = cfg.rows[at]
+        at    = (prow and prow.parent ~= "") and cfg.byName[prow.parent] or nil
+        guard = guard + 1
+      end
+    end
+  end
+
+  return worst, worstN
+end
+
+--  Every column that can actually become live, in the order an operator reads
+--  them.  A BLANK column is skipped: PIN Off blank fails open and permits
+--  everything, and a blank Default or PIN column already has a louder message
+--  of its own further up.
+local function ColumnsToAudit()
+  local list = {}
+  if ColumnHasTicks(defCol) then list[#list + 1] = { name = "Default", col = defCol } end
+  if ColumnHasTicks(offCol) then list[#list + 1] = { name = "PIN Off", col = offCol } end
+  for k = 1, pinCount do
+    if ColumnHasTicks(pinCol[k]) then
+      list[#list + 1] = { name = "PIN " .. k, col = pinCol[k] }
+    end
+  end
+  return list
+end
+
+--  The config summary, and the two ways a permission column can be wrong.
+--  Separate from LoadConfig because ticking a permission cell changes the
+--  answer without changing the parse - and it is called BEFORE Apply, so a
+--  layer the UCI does not have can still overwrite it with its fault.
+local function RefreshStatus()
+  if not cfg.ok then return end
+
+  if cfg.uci == "" or cfg.page == "" then
+    SetStatus(STATUS_NOT_PRESENT, "Enter a UCI name and page")
+  elseif Controls["pin enabled"].Boolean and not ColumnHasTicks(defCol) then
+    --  A security column fails closed, so this configuration shows nothing at
+    --  all until somebody logs in.  Say so, loudly, rather than leaving a
+    --  commissioning engineer looking at a black panel with no way back to it
+    --  from the touchscreen.
+    SetStatus(STATUS_NOT_PRESENT,
+      "PIN enabled but the Default column is empty - nothing shows while locked")
+  else
+    local empty = Controls["pin enabled"].Boolean and EmptyPinColumn() or nil
+    local configuredButOff = false
+    if not Controls["pin enabled"].Boolean then
+      configuredButOff = ColumnHasTicks(defCol)
+      for k = 1, pinCount do
+        configuredButOff = configuredButOff or ColumnHasTicks(pinCol[k])
+      end
+    end
+
+    --  Ahead of the "not armed" nag: a column that cannot show its own layers
+    --  is a broken panel, and an unarmed lock is only an unlocked one.
+    local blockCol, blockRow, blockN, blockAlso = nil, nil, nil, {}
+    for _, entry in ipairs(ColumnsToAudit()) do
+      local ancestor, n = BlockedByColumn(entry.col)
+      if ancestor then
+        if not blockCol then
+          blockCol, blockRow, blockN = entry.name, ancestor, n
+        else
+          blockAlso[#blockAlso + 1] = entry.name
+        end
+      end
+    end
+
+    if empty then
+      SetStatus(STATUS_NOT_PRESENT, string.format(
+        "PIN enabled but the PIN %d column is empty - that code would show nothing", empty))
+    elseif blockCol then
+      SetStatus(STATUS_NOT_PRESENT, string.format(
+        "%s permits %d layer(s) under \"%s\" but not that parent row itself%s",
+        blockCol, blockN, cfg.rows[blockRow].name,
+        (#blockAlso > 0) and (" - and so does " .. table.concat(blockAlso, ", ")) or ""))
+    elseif configuredButOff then
+      --  The one configuration that fails OPEN, and it looked like a healthy
+      --  OK: a fully ticked permission grid with the master switch off is a
+      --  lock somebody built and nobody armed.
+      SetStatus(STATUS_NOT_PRESENT,
+        "PIN columns are configured but PIN Enabled is off - the lock is not armed")
+    else
+      SetStatus(STATUS_OK, string.format(
+        "%d layer(s), %d group(s), %d PIN code(s)", CountRows(), #cfg.groupOrder, pinCount))
+    end
+  end
+end
+
+local function LoadConfig()
+  if reentrant then return end
+  reentrant = true
+  local ok, err = pcall(function()
+
+    SetStatus(STATUS_OK, "")
+    cfg.uci        = Controls.uci.String
+    cfg.page       = Controls.page.String
+    cfg.rows       = {}
+    cfg.byName     = {}
+    cfg.groups     = {}
+    cfg.groupOrder = {}
+    cfg.ok         = false
+
+    --  nil already reads as false, but a dense table is what makes the group
+    --  passes below easy to reason about.  `or false` never clobbers a live
+    --  request - a config edit must not move the panel.
+    for i = 1, layerCount do requested[i] = requested[i] or false end
+
+    --  Hide anything this row was LAST driving before the name changes under
+    --  it.  applied[] is keyed by row index, not by layer name, so renaming or
+    --  blanking a Layer Name used to forget the old layer while it was still on
+    --  screen - and nothing afterwards could reach it, because no row claimed
+    --  that name any more.
+    for i = 1, layerCount do
+      local was = appliedName[i]
+      if was and was ~= Controls.layer[i].String and cfg.uci ~= "" and cfg.page ~= "" then
+        pcall(function()
+          Uci.SetLayerVisibility(cfg.uci, cfg.page, was, false, nil)
+        end)
+        appliedName[i] = nil
+        applied[i]     = nil
+      end
+    end
+
+    --  Snapshot the grid text once.
+    local names, parents, radios = {}, {}, {}
+    for i = 1, layerCount do
+      local n = Controls.layer[i].String
+      if n ~= "" then names[n] = names[n] or i end
+      parents[i] = Controls.parent[i].String
+      radios[i]  = Controls["radio group"][i].String
+      Controls["radio group"][i].Color = "white"
+    end
+
+    --  Duplicate layer names would make parent resolution ambiguous.
+    for i = 1, layerCount do
+      local a = Controls.layer[i].String
+      if a ~= "" then
+        for q = i + 1, layerCount do
+          if Controls.layer[q].String == a then
+            SetStatus(STATUS_FAULT, string.format("Rows %d and %d are both \"%s\"", i, q, a))
+            return
+          end
+        end
+      end
+    end
+
+    --  Rebuilding the choice lists can clear a parent that is no longer on
+    --  offer, so re-snapshot before anything reads the parent chain.
+    RebuildParentChoices(names, parents, radios)
+    for i = 1, layerCount do parents[i] = Controls.parent[i].String end
+
+    --  Build row records and group membership in grid order.
+    for i = 1, layerCount do
+      local name = Controls.layer[i].String
+      if name ~= "" then
+        local row = {
+          index    = i,
+          name     = name,
+          radio    = Controls["radio group"][i].String,
+          parent   = Controls.parent[i].String,
+          logical  = Controls["logical parent"][i].Boolean,
+          transIn  = TransitionValue(Controls["transition in"][i].String),
+          transOut = TransitionValue(Controls["transition out"][i].String),
+        }
+        cfg.rows[i]         = row
+        cfg.byName[name]    = i
+
+        if row.radio ~= "" then
+          local g = cfg.groups[row.radio]
+          if not g then
+            g = { members = {}, sticky = false, resetOnParent = false }
+            cfg.groups[row.radio]              = g
+            cfg.groupOrder[#cfg.groupOrder + 1] = row.radio
+          end
+          g.members[#g.members + 1] = i
+        end
+      end
+    end
+
+    --  Reject parent loops up front rather than trapping a runaway recursion.
+    for i in pairs(cfg.rows) do
+      if IsDescendantOf(cfg.byName[cfg.rows[i].parent] or nil, i, cfg.byName, parents) then
+        SetStatus(STATUS_FAULT, string.format("Row %d creates a parent loop", i))
+        return
+      end
+    end
+
+    --  Sticky and Reset Group are per-GROUP: the first member owns the tick,
+    --  the others mirror it and grey out.  Rows with no group get neither.
+    for i = 1, layerCount do
+      local row = cfg.rows[i]
+      local g   = row and row.radio ~= "" and cfg.groups[row.radio] or nil
+      if g and g.members[1] == i then
+        Controls.sticky[i].IsDisabled            = false
+        Controls["reset on parent"][i].IsDisabled = false
+        g.sticky        = Controls.sticky[i].Boolean
+        g.resetOnParent = Controls["reset on parent"][i].Boolean
+      elseif g then
+        local owner = g.members[1]
+        Controls.sticky[i].IsDisabled             = true
+        Controls["reset on parent"][i].IsDisabled = true
+        Controls.sticky[i].Boolean                = Controls.sticky[owner].Boolean
+        Controls["reset on parent"][i].Boolean    = Controls["reset on parent"][owner].Boolean
+      else
+        Controls.sticky[i].IsDisabled             = true
+        Controls["reset on parent"][i].IsDisabled = true
+        Controls.sticky[i].Boolean                = false
+        Controls["reset on parent"][i].Boolean    = false
+      end
+    end
+
+    --  Colour-code the groups.
+    for gi, name in ipairs(cfg.groupOrder) do
+      local color = GROUP_COLORS[((gi - 1) % #GROUP_COLORS) + 1]
+      for _, m in ipairs(cfg.groups[name].members) do
+        Controls["radio group"][m].Color = color
+      end
+    end
+
+    --  Enforce radio exclusivity on whatever state the grid was left in:
+    --  keep the first live member of each group, clear the rest.
+    ExclusiveGroups()
+
+    --  Clear the request and the visibility LED on rows that are not
+    --  configured, so blanking a row name does not leave a stale lit indicator
+    --  behind - and grey out the permission cells, the same way Sticky and
+    --  Reset Group grey out above.
+    --
+    --  The TICKS are left alone: a row whose name is being retyped must not
+    --  silently lose its Default / PIN configuration.  Controls.enable is not
+    --  written here either - the Apply(true) at the end of this function
+    --  writes every enable anyway, which keeps the whole config path away from
+    --  the echo hazard.
+    for i = 1, layerCount do
+      local off = (cfg.rows[i] == nil)
+      if off then
+        requested[i]                = false
+        Controls.visible[i].Boolean = false
+      end
+      defCol[i].IsDisabled = off
+      offCol[i].IsDisabled = off
+      for k = 1, pinCount do pinCol[k][i].IsDisabled = off end
+    end
+
+    cfg.ok = true
+
+    --  Record the parent visibility that ACTUALLY EXISTS rather than asserting
+    --  everything was down.  Zeroing it meant every config edit after the first
+    --  handed the following Apply a phantom "the parent just came up" edge, and
+    --  every Reset Group snapped back to its first member - so touching any
+    --  cell in the grid moved the panel.
+    ResolveColumn()
+    PrimeParentEdges()
+
+    RefreshStatus()
+
+  end)
+  reentrant = false
+
+  if not ok then
+    SetStatus(STATUS_FAULT, "Config error: " .. tostring(err))
+    return
+  end
+
+  applied = {}
+  Apply(true)
+
+  --  SAY SO.  A config reload does not move the live column, so Apply's own
+  --  `moved` test is false and nothing pulsed - yet a grid edit can have
+  --  re-parented a row, renamed one, changed a group or blanked a row's
+  --  request outright.  Everything downstream was left holding the world as it
+  --  was before the edit, and the only way back to a sane panel was to go and
+  --  toggle each layer by hand.
+  --
+  --  Also covers STARTUP, which ends here: the script states itself once the
+  --  grid is parsed instead of waiting for the first login.
+  --
+  --  AFTER Apply, like Reset does, so a listener reads the world the edit
+  --  produced rather than the one it replaced.  It fires per keystroke while
+  --  the grid is being typed into, which is commissioning-time noise and the
+  --  point: the panel follows the grid as it is edited.
+  Reassert()
+end
+
+--------------------------------------------------------------
+--  Enable presses
+--------------------------------------------------------------
+local function OnEnablePressed(i)
+  if reentrant then return end
+
+  --  READ, therefore no longer pending.  Deliberately NOT shown[]: that is the
+  --  value a refused press snaps back to, and moving it here would snap back to
+  --  the press itself.
+  seen[i] = Controls.enable[i].Boolean
+
+  --  A config fault empties cfg.rows, so without this every row looks
+  --  unconfigured and the branch below would DESTROY the request behind any
+  --  enable an external script writes while the fault stands.  Clearing the
+  --  fault would then neither re-seed nor pulse Reassert to ask for it back.
+  --  Snap the pin and touch nothing.
+  if not cfg.ok then
+    SetEnable(i, shown[i] or false)
+    return
+  end
+
+  local row = cfg.rows[i]
+  if not row then
+    requested[i] = false
+    SetEnable(i, false)
+    return
+  end
+
+  --  A row the live column does not permit is INERT: snap the control back and
+  --  touch nothing else.  This is the security boundary and it has to be here
+  --  rather than in Apply, because 'enable' is a user pin - a script on a
+  --  locked panel writes through exactly this handler, and a masked press must
+  --  not be allowed to clear its siblings' remembered requests either.
+  if not Permitted(i) then
+    --  REMEMBER IT ANYWAY.  requested[] is what the venue WANTS and the live
+    --  column is who is allowed it; those are different questions and this is
+    --  the line that used to conflate them.  Dropping the write made the
+    --  promise above true only for a request made while PERMITTED and masked
+    --  afterwards - a request made WHILE masked was lost outright.  So every
+    --  layer an external script owns had to be re-stated inside the one
+    --  Reassert round-trip that follows a login, with no memory to fall back
+    --  on if that pulse was missed, and a Logical Parent gate that no column
+    --  seeds could never come up at all: its children read enable true and
+    --  visible false behind a green Status.
+    --
+    --  Siblings are deliberately NOT cleared: a masked write must not be able
+    --  to drop the group member the live column IS showing.  ExclusiveGroups
+    --  settles a doubly-requested group the next time both members are live.
+    --
+    --  Apply is deliberately NOT called: nothing on screen can move while the
+    --  row is forbidden, and the snap-back below is the only visible effect.
+    --  The mask is untouched, so this cannot let anything through - Enabled()
+    --  still gates every read of requested[] on Permitted().
+    requested[i] = Controls.enable[i].Boolean
+    SetEnable(i, shown[i] or false)
+    return
+  end
+
+  local v = Controls.enable[i].Boolean
+
+  if row.radio ~= "" then
+    local g = cfg.groups[row.radio]
+    if v then
+      --  Newly selected - clear every sibling.
+      for _, m in ipairs(g.members) do requested[m] = (m == i) end
+    elseif g.sticky then
+      --  STICKY: the live member was pressed again.  Refuse to clear it, so the
+      --  group can never end up showing nothing.
+      requested[i] = true
+    else
+      requested[i] = false
+    end
+  else
+    requested[i] = v
+  end
+
+  --  Note the sticky branch no longer writes the control: Apply publishes it,
+  --  so a refusal cannot outrun the mask.
+  Apply(false)
+end
+
+--------------------------------------------------------------
+--  Reset
+--------------------------------------------------------------
+--  Reset is a LAYER-state trigger, not a logout: 'lock' owns the session and
+--  this deliberately leaves activePin alone.  It re-seeds PIN Off while the
+--  PIN system is disabled, or Default otherwise; clearing to nothing would
+--  leave every ungrouped row off with no way back short of logging out.
+local function ResetLayers()
+  if not cfg.ok then return end
+  ResolveColumn()
+  --  Seed the live column when it is a state column, and Default otherwise -
+  --  a PIN column is permission and has no state to restore, and Default is by
+  --  definition what the page loads with.
+  --
+  --  The MASK is what makes that safe on a panel somebody is logged into: the
+  --  Default ticks the live PIN column forbids are written as requests and then
+  --  masked straight back off, sticky refills the groups they emptied, and the
+  --  rows both columns tick - the background, typically - come back up.  An
+  --  earlier cut cleared the requests instead and left every ungrouped layer
+  --  off with nothing able to put it back.
+  --  ALWAYS Default.  PIN Off stopped being a state column in v0.9.7, so there
+  --  is nothing else a Reset could restore FROM.  Reset while the PIN system is
+  --  off therefore re-states the Default ticks and lets PIN Off mask them -
+  --  which drops the login screen for you, because PIN Off does not tick it.
+  local seedCol = defCol
+  --  A blank state column is explicitly UNCONFIGURED and SeedFrom is a no-op.
+  --  Do not clear first or Reset turns that no-op into a panel-wide wipe,
+  --  breaking the v0.9-compatible blank PIN Off path.
+  if ColumnHasTicks(seedCol) then
+    for i = 1, layerCount do requested[i] = false end
+    SeedFrom(seedCol)
+  end
+  applied = {}
+  for _, name in ipairs(cfg.groupOrder) do parentWasUp[name] = false end
+  Apply(true)
+  --  After Apply, for the same reason Apply defers its own: a listener has to
+  --  see the layers Reset produced, not the ones it replaced.
+  Reassert()
+end
+
+--------------------------------------------------------------
+--  Event handlers
+--------------------------------------------------------------
+Controls.uci.EventHandler   = LoadConfig
+Controls.page.EventHandler  = LoadConfig
+Controls.reset.EventHandler = ResetLayers
+
+--  PIN ACCESS --------------------------------------------------------------
+Controls["pin enabled"].EventHandler = function()
+  --  Switching the PIN system back ON lands LOCKED, always.  Carrying a live
+  --  session across that toggle would make it a way to be let in.
+  activePin = nil
+  --  Status before Apply: an empty Default column is exactly the mistake this
+  --  toggle exposes, and Apply may then overwrite it with a real layer fault.
+  RefreshStatus()
+  Apply(false)
+end
+
+Controls.lock.EventHandler = function()
+  activePin = nil          -- the colKey change in Apply re-seeds Default
+  Apply(false)
+end
+
+for k = 1, pinCount do
+  local index = k
+  pinMatch[index].EventHandler = function(ctl)
+    local v = ctl.Boolean and true or false
+    --  RISING EDGE ONLY, never the level.  The stock PIN Pad is not documented
+    --  either way on whether pin.match.N latches after a match or merely
+    --  pulses, and on an edge it does not matter: the edge happens exactly once
+    --  per login either way, and a level left latched across a logout raises no
+    --  new edge, so it cannot hand its layers to the next person who logs in on
+    --  an ordinary code.
+    --
+    --  Last rising edge wins, so exactly one code is ever live.
+    if v and not matchWas[index] then activePin = index end
+    matchWas[index] = v
+    Apply(false)
+  end
+end
+
+--  A permission tick is not a config change - nothing needs re-parsing, the
+--  mask just has to be re-applied.  A tick in the column that is BOTH live and
+--  seeding is mirrored into the request as well, so a commissioning engineer
+--  sees the effect the moment they tick it rather than at the next logout.
+local function OnColumnEdit(key, col, i)
+  if seededKey == key and key == "default" then
+    requested[i] = col[i].Boolean
+  end
+  RefreshStatus()
+  Apply(false)
+
+  --  Only for the column that is actually LIVE, and only after Apply.
+  --  WIDENING a mask raises nothing by itself - that is the whole point of a
+  --  permission column - so ticking a cell for a layer nothing has requested
+  --  does exactly nothing visible, and the commissioning engineer concludes the
+  --  tick does not work.  This asks whoever owns that layer to say again what
+  --  it wants, so the panel follows the grid as it is edited.
+  --
+  --  A tick in a column that is not live still changes nothing, correctly, and
+  --  is not worth waking anything for.
+  if key == colKey then Reassert() end
+end
+
+for i = 1, layerCount do
+  Controls["transition in"][i].Choices  = TRANSITION_NAMES
+  Controls["transition out"][i].Choices = TRANSITION_NAMES
+
+  Controls.layer[i].EventHandler            = LoadConfig
+  Controls.parent[i].EventHandler           = LoadConfig
+  Controls["logical parent"][i].EventHandler = LoadConfig
+  Controls["transition in"][i].EventHandler  = LoadConfig
+  Controls["transition out"][i].EventHandler = LoadConfig
+  Controls.sticky[i].EventHandler            = LoadConfig
+  Controls["reset on parent"][i].EventHandler = LoadConfig
+
+  --  Changing a row's group invalidates its parent choice, so clear it first.
+  Controls["radio group"][i].EventHandler = function()
+    Controls.parent[i].String = ""
+    LoadConfig()
+  end
+
+  Controls["allow default"][i].EventHandler = function() OnColumnEdit("default", defCol, i) end
+  Controls["allow off"][i].EventHandler     = function() OnColumnEdit("off",     offCol, i) end
+  for k = 1, pinCount do
+    --  `col` and `key` captured as locals: reading pinCol[k] inside the
+    --  closure would work here, but the loop-variable upvalue is the classic
+    --  Lua footgun and an explicit capture says so.
+    local col, key = pinCol[k], "pin" .. k
+    Controls["allow pin " .. k][i].EventHandler = function() OnColumnEdit(key, col, i) end
+  end
+
+  Controls.enable[i].EventHandler = function()
+    --  Our own masked write-back, arriving a frame late.  Not a press.
+    if Controls.enable[i].Boolean == shown[i] then return end
+    OnEnablePressed(i)
+  end
+end
+
+--------------------------------------------------------------
+--  Startup
+--------------------------------------------------------------
+--  Startup lands LOCKED whatever the pad believes.  matchWas was armed from
+--  the current levels at chunk load, so a pin.match.N still latched from the
+--  last session raises no edge here.
+--
+--  Deliberately NOT re-armed on 'lock': re-arming to the current level is a
+--  no-op for a pulsing pad and would block a re-login on the same code for a
+--  latching one.  Dropping the match on logout is the PAD's job, and
+--  UCITextController_V1.6.lua does it there.
+activePin = nil
+PublishPinState()
+
+--  Adopt the enables Q-SYS restored as the starting REQUESTS.  Control values
+--  persist across a Core restart, and v0.9 came back up showing what it was
+--  showing; without this the first Apply would write every request false and
+--  blank the panel on every restart and on every upgrade from v0.9.
+--
+--  A configured state column then overwrites this on the first Apply, which is
+--  what makes a PIN-enabled panel come back LOCKED rather than come back open.
+for i = 1, layerCount do
+  requested[i] = Controls.enable[i].Boolean and true or false
+  shown[i]     = requested[i]
+  seen[i]      = requested[i]
+end
+
+LoadConfig()   -- ends in Apply(true), which seeds the live column
+
+end
